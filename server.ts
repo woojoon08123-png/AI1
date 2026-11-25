@@ -12,13 +12,14 @@ const __dirname = path.dirname(__filename);
 
 const PORT = Number(process.env.PORT) || 3000;
 
-function createAiClient() {
+function createAiClient(apiVersion?: string) {
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey) {
     throw new Error('GEMINI_API_KEY 환경 변수가 설정되어 있지 않습니다. Settings > Secrets 패널을 확인해 주세요.');
   }
   return new GoogleGenAI({
     apiKey,
+    ...(apiVersion ? { apiVersion } : {}),
     httpOptions: {
       headers: {
         'User-Agent': 'aistudio-build',
@@ -27,14 +28,32 @@ function createAiClient() {
   });
 }
 
+function extractErrorText(err: unknown): string {
+  if (err instanceof Error) return err.message;
+  if (err && typeof err === 'object') {
+    const obj = err as Record<string, unknown>;
+    if (typeof obj.message === 'string' && obj.message) return obj.message;
+    if (obj.error && typeof obj.error === 'object') {
+      const inner = obj.error as Record<string, unknown>;
+      if (typeof inner.message === 'string') return inner.message;
+    }
+    try {
+      return JSON.stringify(err);
+    } catch {
+      return String(err);
+    }
+  }
+  return String(err);
+}
+
 function formatApiError(err: unknown): { status: number; message: string } {
-  const raw = err instanceof Error ? err.message : String(err);
+  const raw = extractErrorText(err);
   if (raw.includes('GEMINI_API_KEY')) {
     return { status: 500, message: raw };
   }
-  if (raw.includes('PERMISSION_DENIED') || raw.includes('403') || raw.includes('API_KEY_INVALID') || raw.includes('400')) {
+  if (raw.includes('PERMISSION_DENIED') || raw.includes('403') || raw.includes('API_KEY_INVALID')) {
     return {
-      status: 400,
+      status: 403,
       message: 'Gemini API 키가 유효하지 않거나 권한이 없습니다. Settings > Secrets 패널에서 API 키를 확인해 주세요.',
     };
   }
@@ -42,6 +61,12 @@ function formatApiError(err: unknown): { status: number; message: string } {
     return {
       status: 429,
       message: '요청 한도에 도달했습니다. 잠시 후 다시 시도하거나 Settings > Secrets에서 API 키 할당량을 확인해 주세요.',
+    };
+  }
+  if (raw.includes('400') || raw.includes('INVALID_ARGUMENT')) {
+    return {
+      status: 400,
+      message: `음성 요청 파라미터 오류: ${raw}`,
     };
   }
   return {
@@ -107,34 +132,32 @@ async function startServer() {
         (text || '').trim().slice(0, 300) ||
         '오늘 하루 정말 고생 많았어요. 지금 마음이 어떤지 편하게 들려주세요.';
 
-      const ai = createAiClient();
-      const response = await ai.models.generateContent({
+      const ai = createAiClient('v1beta');
+      const interaction = await ai.interactions.create({
         model: 'gemini-3.8-flash-lite-tts',
-        contents: [
+        input: [
           {
-            role: 'user',
-            parts: [
+            type: 'text',
+            text: safeText,
+            annotations: [
               {
-                text: safeText,
-                speechMetadata: {
-                  style: styleHint || 'Warm, gentle, empathetic Korean voice',
-                },
+                type: 'speech_metadata',
+                style: styleHint || 'Warm, gentle, empathetic Korean voice',
               },
             ],
           },
         ],
-        config: {
-          responseModalities: ['AUDIO'],
-          speechConfig: {
-            voiceConfig: {
-              prebuiltVoiceConfig: { voiceName: safeVoice },
+        response_format: { type: 'audio' },
+        generation_config: {
+          speech_config: [
+            {
+              voice: safeVoice,
             },
-          },
+          ],
         },
       });
 
-      const audioData =
-        response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
+      const audioData = interaction.output_audio?.data;
       if (!audioData) {
         return res.status(502).json({ error: '음성 데이터를 생성하지 못했습니다.' });
       }
@@ -177,16 +200,31 @@ async function startServer() {
         { role: 'user', parts: [{ text: message.trim() }] },
       ];
 
-      const textResponse = await ai.models.generateContent({
-        model: 'gemini-4-hydrogen',
-        contents,
-        config: {
-          systemInstruction: buildEmpathySystemInstruction(persona, userName),
-          thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
-        },
-      });
+      let textResponse;
+      const candidateModels = ['gemini-4-hydrogen', 'gemini-4-hydrogen', 'gemini-3.1-flash-lite'];
+      for (let attempt = 0; attempt < candidateModels.length; attempt++) {
+        const model = candidateModels[attempt];
+        try {
+          textResponse = await ai.models.generateContent({
+            model,
+            contents,
+            config: {
+              systemInstruction: buildEmpathySystemInstruction(persona, userName),
+              ...(model === 'gemini-4-hydrogen'
+                ? { thinkingConfig: { thinkingLevel: ThinkingLevel.LOW } }
+                : {}),
+            },
+          });
+          break;
+        } catch (retryErr) {
+          const msg = extractErrorText(retryErr);
+          const isTransient = msg.includes('503') || msg.includes('UNAVAILABLE') || msg.includes('429');
+          if (!isTransient || attempt === candidateModels.length - 1) throw retryErr;
+          await new Promise((r) => setTimeout(r, 400 * (attempt + 1)));
+        }
+      }
 
-      const replyText = (textResponse.text || '').trim();
+      const replyText = (textResponse?.text || '').trim();
       if (!replyText) {
         return res.status(502).json({ error: '응답을 생성하지 못했습니다.' });
       }
@@ -194,35 +232,34 @@ async function startServer() {
       let audioBase64: string | null = null;
       if (withAudio) {
         try {
+          const betaAi = createAiClient('v1beta');
           const safeVoice = VALID_VOICES.has(voiceName) ? voiceName : 'Kore';
-          const ttsRes = await ai.models.generateContent({
+          const ttsInteraction = await betaAi.interactions.create({
             model: 'gemini-3.8-flash-lite-tts',
-            contents: [
+            input: [
               {
-                role: 'user',
-                parts: [
+                type: 'text',
+                text: replyText,
+                annotations: [
                   {
-                    text: replyText,
-                    speechMetadata: {
-                      style: 'Warm, empathetic, natural Korean conversational voice',
-                    },
+                    type: 'speech_metadata',
+                    style: 'Warm, empathetic, natural Korean conversational voice',
                   },
                 ],
               },
             ],
-            config: {
-              responseModalities: ['AUDIO'],
-              speechConfig: {
-                voiceConfig: {
-                  prebuiltVoiceConfig: { voiceName: safeVoice },
+            response_format: { type: 'audio' },
+            generation_config: {
+              speech_config: [
+                {
+                  voice: safeVoice,
                 },
-              },
+              ],
             },
           });
-          audioBase64 =
-            ttsRes.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data ?? null;
+          audioBase64 = ttsInteraction.output_audio?.data ?? null;
         } catch (ttsErr) {
-          console.error('TTS generation error in text-empathy:', ttsErr);
+          console.error('TTS generation error in text-empathy:', extractErrorText(ttsErr));
         }
       }
 
@@ -324,7 +361,7 @@ async function startServer() {
     };
 
     try {
-      const ai = createAiClient();
+      const ai = createAiClient('v1beta');
       session = await ai.live.connect({
         model: 'gemini-3.8-live',
         config: {
@@ -373,7 +410,10 @@ async function startServer() {
               sendToClient({ type: 'interrupted' });
             }
 
-            if (serverContent.turnComplete) {
+            if (
+              serverContent.turnComplete ||
+              (serverContent as { generationComplete?: boolean }).generationComplete
+            ) {
               sendToClient({ type: 'turnComplete' });
             }
           },
@@ -394,6 +434,15 @@ async function startServer() {
         session.close();
         return;
       }
+
+      // Trigger a warm, natural spoken greeting so the user immediately hears the voice is connected
+      const greetingCue = userName?.trim()
+        ? `(방금 '${userName.trim()}'님이 음성 대화에 들어왔습니다. 따뜻하고 자연스럽게 반기며 오늘 하루가 어땠는지 한두 문장으로 먼저 말을 걸어주세요.)`
+        : '(방금 사용자가 음성 대화에 들어왔습니다. 따뜻하고 자연스럽게 반기며 오늘 기분이나 하루가 어땠는지 한두 문장으로 먼저 말을 걸어주세요.)';
+      session.sendClientContent({
+        turns: [{ role: 'user', parts: [{ text: greetingCue }] }],
+        turnComplete: true,
+      });
     } catch (err) {
       console.error('Failed to initialize Gemini Live session:', err);
       const formatted = formatApiError(err);
@@ -415,7 +464,10 @@ async function startServer() {
             audio: { data: msg.data, mimeType: 'audio/pcm;rate=16000' },
           });
         } else if (msg.type === 'text' && msg.text?.trim()) {
-          session.sendRealtimeInput({ text: msg.text.trim() });
+          session.sendClientContent({
+            turns: [{ role: 'user', parts: [{ text: msg.text.trim() }] }],
+            turnComplete: true,
+          });
         }
       } catch (err) {
         console.error('WebSocket message handling error:', err);

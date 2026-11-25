@@ -107,6 +107,8 @@ export default function App() {
     transcript,
     elapsedSeconds,
     isQuietSending,
+    speakingEntryId,
+    loadingSpeechEntryId,
     inputAnalyserRef,
     outputAnalyserRef,
     startSession,
@@ -114,6 +116,7 @@ export default function App() {
     toggleMute,
     interruptAssistant,
     sendMessage,
+    speakEntryText,
     resetConversation,
     clearError,
   } = useLiveEmpathySession({
@@ -410,6 +413,9 @@ export default function App() {
                 isReflecting={isReflecting}
                 latestReflection={latestReflection}
                 onViewJournal={() => setActiveTab('journal')}
+                onSpeakText={(entryId, text) => void speakEntryText(entryId, text)}
+                speakingEntryId={speakingEntryId}
+                loadingSpeechEntryId={loadingSpeechEntryId}
               />
             </div>
           </div>

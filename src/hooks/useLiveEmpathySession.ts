@@ -29,6 +29,8 @@ export function useLiveEmpathySession({
   const [transcript, setTranscript] = useState<TranscriptEntry[]>([]);
   const [elapsedSeconds, setElapsedSeconds] = useState(0);
   const [isQuietSending, setIsQuietSending] = useState(false);
+  const [speakingEntryId, setSpeakingEntryId] = useState<string | null>(null);
+  const [loadingSpeechEntryId, setLoadingSpeechEntryId] = useState<string | null>(null);
 
   const wsRef = useRef<WebSocket | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
@@ -72,6 +74,7 @@ export function useLiveEmpathySession({
       window.clearTimeout(speakingTimeoutRef.current);
       speakingTimeoutRef.current = null;
     }
+    setSpeakingEntryId(null);
   }, []);
 
   const ensureOutputAudioContext = useCallback(() => {
@@ -233,6 +236,9 @@ export function useLiveEmpathySession({
     setIsMuted(false);
     isMutedRef.current = false;
 
+    // Unlock output AudioContext synchronously inside user click gesture
+    ensureOutputAudioContext();
+
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
         audio: {
@@ -242,8 +248,6 @@ export function useLiveEmpathySession({
         },
       });
       streamRef.current = stream;
-
-      ensureOutputAudioContext();
 
       const inputCtx = new AudioContext({ sampleRate: 16000 });
       if (inputCtx.state === 'suspended') {
@@ -380,6 +384,11 @@ export function useLiveEmpathySession({
       if (!text) return;
       setErrorMessage(null);
 
+      // Unlock output AudioContext synchronously within user gesture before async fetch
+      if (speakResponseInQuietMode) {
+        ensureOutputAudioContext();
+      }
+
       // If Live WebSocket is connected, send directly into the live session
       if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
         finalizeStreamingTurns();
@@ -457,12 +466,15 @@ export function useLiveEmpathySession({
         if (data.audioBase64 && speakResponseInQuietMode) {
           stopAllPlayback();
           const { ctx, analyser } = ensureOutputAudioContext();
+          if (ctx.state === 'suspended') {
+            await ctx.resume();
+          }
           const binary = atob(data.audioBase64);
           const bytes = new Uint8Array(binary.length);
           for (let i = 0; i < binary.length; i++) {
             bytes[i] = binary.charCodeAt(i);
           }
-          const decodedBuffer = await ctx.decodeAudioData(bytes.buffer);
+          const decodedBuffer = await ctx.decodeAudioData(bytes.buffer.slice(0));
           const src = ctx.createBufferSource();
           src.buffer = decodedBuffer;
           src.connect(analyser);
@@ -474,7 +486,7 @@ export function useLiveEmpathySession({
               updateStatus('idle');
             }
           };
-          src.start();
+          src.start(0);
         } else {
           updateStatus('idle');
         }
@@ -497,6 +509,73 @@ export function useLiveEmpathySession({
       userName,
       voiceName,
     ]
+  );
+
+  const speakEntryText = useCallback(
+    async (entryId: string, text: string) => {
+      if (speakingEntryId === entryId) {
+        stopAllPlayback();
+        if (wsRef.current?.readyState === WebSocket.OPEN) {
+          updateStatus('listening');
+        } else {
+          updateStatus('idle');
+        }
+        return;
+      }
+
+      setErrorMessage(null);
+      ensureOutputAudioContext();
+      stopAllPlayback();
+      setLoadingSpeechEntryId(entryId);
+
+      try {
+        const res = await fetch('/api/tts-preview', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            voiceName,
+            text: text.slice(0, 300),
+            styleHint: 'Warm, gentle, empathetic Korean voice',
+          }),
+        });
+        const data = (await res.json()) as { audioBase64?: string; error?: string };
+        if (!res.ok || !data.audioBase64) {
+          throw new Error(data.error || '음성을 불러오지 못했습니다.');
+        }
+
+        const { ctx, analyser } = ensureOutputAudioContext();
+        if (ctx.state === 'suspended') {
+          await ctx.resume();
+        }
+        const binary = atob(data.audioBase64);
+        const bytes = new Uint8Array(binary.length);
+        for (let i = 0; i < binary.length; i++) {
+          bytes[i] = binary.charCodeAt(i);
+        }
+        const decodedBuffer = await ctx.decodeAudioData(bytes.buffer.slice(0));
+        const src = ctx.createBufferSource();
+        src.buffer = decodedBuffer;
+        src.connect(analyser);
+        activeSourcesRef.current.add(src);
+        setSpeakingEntryId(entryId);
+        updateStatus('speaking');
+        src.onended = () => {
+          activeSourcesRef.current.delete(src);
+          setSpeakingEntryId(null);
+          if (activeSourcesRef.current.size === 0 && statusRef.current === 'speaking') {
+            updateStatus(wsRef.current?.readyState === WebSocket.OPEN ? 'listening' : 'idle');
+          }
+        };
+        src.start(0);
+      } catch (err) {
+        setErrorMessage(
+          err instanceof Error ? err.message : '음성 재생 중 오류가 발생했습니다.'
+        );
+      } finally {
+        setLoadingSpeechEntryId(null);
+      }
+    },
+    [ensureOutputAudioContext, speakingEntryId, stopAllPlayback, updateStatus, voiceName]
   );
 
   const toggleMute = useCallback(() => {
@@ -536,6 +615,8 @@ export function useLiveEmpathySession({
     transcript,
     elapsedSeconds,
     isQuietSending,
+    speakingEntryId,
+    loadingSpeechEntryId,
     inputAnalyserRef,
     outputAnalyserRef,
     startSession,
@@ -543,6 +624,7 @@ export function useLiveEmpathySession({
     toggleMute,
     interruptAssistant,
     sendMessage,
+    speakEntryText,
     resetConversation,
     clearError: () => setErrorMessage(null),
   };

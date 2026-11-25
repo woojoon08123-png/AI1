@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import { BookOpenCheck, Coffee, Loader2, SendHorizontal } from 'lucide-react';
+import { BookOpenCheck, Coffee, Loader2, SendHorizontal, Volume2, Square } from 'lucide-react';
 import type { ReflectionRecord, SessionStatus, TranscriptEntry } from '../types/companion';
 
 interface TranscriptPanelProps {
@@ -11,6 +11,9 @@ interface TranscriptPanelProps {
   isReflecting: boolean;
   latestReflection: ReflectionRecord | null;
   onViewJournal: () => void;
+  onSpeakText?: (entryId: string, text: string) => void;
+  speakingEntryId?: string | null;
+  loadingSpeechEntryId?: string | null;
 }
 
 const STARTER_PROMPTS = [
@@ -35,6 +38,9 @@ export function TranscriptPanel({
   isReflecting,
   latestReflection,
   onViewJournal,
+  onSpeakText,
+  speakingEntryId,
+  loadingSpeechEntryId,
 }: TranscriptPanelProps) {
   const [draftText, setDraftText] = useState('');
   const [imgFailed, setImgFailed] = useState(false);
@@ -120,7 +126,7 @@ export function TranscriptPanel({
                   어떤 이야기도 서두르지 않아도 돼요
                 </p>
                 <p className="mt-1 text-[13px] leading-relaxed text-[#6E6A63] dark:text-[#A39E93]">
-                  왼쪽의 마이크 버튼을 눌러 바로 목소리로 들려주시거나, 말하기 조용한 곳이라면 아래 문장을 눌러 글로 대화를 시작해 보세요.
+                  왼쪽의 마이크 버튼을 눌러 바로 목소리로 들려주시거나, 말하기 조용한 곳이라면 아래 문장을 눌러 글로 대화를 시작해도 온기가 목소리로 답해드려요.
                 </p>
               </div>
             </div>
@@ -148,6 +154,9 @@ export function TranscriptPanel({
           <div className="space-y-5">
             {transcript.map((entry) => {
               const isUser = entry.role === 'user';
+              const isThisSpeaking = speakingEntryId === entry.id;
+              const isThisLoading = loadingSpeechEntryId === entry.id;
+
               return (
                 <article
                   key={entry.id}
@@ -165,6 +174,32 @@ export function TranscriptPanel({
                       <>
                         <span aria-hidden="true">·</span>
                         <span>듣고 적는 중</span>
+                      </>
+                    )}
+                    {!isUser && !entry.isStreaming && onSpeakText && entry.text.trim() && (
+                      <>
+                        <span aria-hidden="true">·</span>
+                        <button
+                          type="button"
+                          onClick={() => onSpeakText(entry.id, entry.text)}
+                          disabled={isThisLoading}
+                          className="inline-flex items-center gap-1 text-xs font-medium text-[#2F5D50] hover:underline disabled:opacity-50 dark:text-[#7AC2AC]"
+                        >
+                          {isThisLoading ? (
+                            <Loader2 className="h-3 w-3 animate-spin" aria-hidden="true" />
+                          ) : isThisSpeaking ? (
+                            <Square className="h-3 w-3 text-[#B4652A]" aria-hidden="true" />
+                          ) : (
+                            <Volume2 className="h-3 w-3" aria-hidden="true" />
+                          )}
+                          <span>
+                            {isThisLoading
+                              ? '음성 준비'
+                              : isThisSpeaking
+                                ? '멈추기'
+                                : '목소리로 듣기'}
+                          </span>
+                        </button>
                       </>
                     )}
                   </div>
