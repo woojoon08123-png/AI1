@@ -1,0 +1,6 @@
+{
+  "name": "온기 — 사람처럼 공감하는 음성 AI",
+  "description": "당신의 목소리와 감정을 깊이 듣고, 사람처럼 따뜻하게 공감해주는 실시간 음성 대화 AI 컴패니언",
+  "requestFramePermissions": ["microphone"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
